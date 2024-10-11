@@ -5,7 +5,7 @@ from pyserini.search.lucene import LuceneSearcher
 from pyserini.index.lucene import IndexReader
 import numpy as np
 import subprocess
-
+import matplotlib.pyplot as plt
 
 def preprocess_corpus(input_file, output_dir):
     os.makedirs(output_dir, exist_ok=True)
@@ -72,30 +72,66 @@ def compute_ndcg(results, qrels, k=10):
         return dcg_simple
 
     ndcg_scores = []
+    
     for qid, query_results in results.items():
         if qid not in qrels:
             # print(f"Query {qid} not found in qrels")
             continue
-        relevances_current = [qrels[qid].get(docid, 0) for docid, _ in query_results]
-        idcg = dcg(sorted(qrels[qid].values(), reverse=True))
+        
+        # compute the top k document's relevance score provided by the qrels label, hit.score doesn't matter
+        relevances_current = [qrels[qid].get(docid, 0) for docid, _ in query_results] 
+        
+        # compute the ideal dcg score if fetched all k documents are highly relevant (defined by qrels)
+        idcg = dcg(sorted(qrels[qid].values(), reverse=True)) 
+        
         if idcg == 0:
             print(f"IDCG is 0 for query {qid}")
             continue
-        ndcg_scores.append(dcg(relevances_current) / idcg)
+        
+        ndcg_scores.append(dcg(relevances_current) / idcg) # record the ndcg@k (normalized) for qid
 
     if not ndcg_scores:
         print("No valid NDCG scores computed")
         return 0.0
-    return np.mean(ndcg_scores)
+    
+    return np.mean(ndcg_scores) # average all query's ndcg and report (under this hyperparameter setting)
 
+def compute_precision(results, qrels, k=10, threshold=1):
+    def ap(relevances, threshold=1): # I thought we need to implement MAP@k=10, but to illustrate average precision, I still left the code here
+        hit_counter = 0
+        precisions = []
+        for i in range(k):
+            if relevances[i] >= threshold:
+                hit_counter += 1
+                precisions.append(hit_counter / (i+1))
+            else:
+                precisions.append(0)
+        return np.mean(precisions)
+    
+    precision_scores = []
+    
+    for qid, query_results in results.items():
+        if qid not in qrels:
+            # print(f"Query {qid} not found in qrels")
+            continue
+        
+        # compute the top k document's relevance score provided by the qrels label, hit.score doesn't matter
+        relevances_current = [qrels[qid].get(docid, 0) for docid, _ in query_results] 
+        
+        precision_score = sum(1 for rel in relevances_current if rel >= threshold) / k
+        precision_scores.append(precision_score)
+        
+    if not precision_scores:
+        print("No valid precision scores computed")
+        return 0.0
+    
+    return np.mean(precision_scores)
 
 def main():
     """main function for searching"""
 
-    """=======TODO: Choose Dataset======="""
     # You can choose from "cranfield", "apnews", and "new_faculty" for dataset
     cname = "cranfield"
-    """============================"""
 
     base_dir = f"data/{cname}"
     query_id_start = {
@@ -136,26 +172,97 @@ def main():
     # Search
     searcher = LuceneSearcher(index_dir)
 
-    """=======TODO: Set Ranking Hyperparameters======="""
-    searcher.set_bm25(k1=0.9, b=0.4)
-    # searcher.set_rm3(20, 10, 0.5) # optional query expansion
-    """========================================="""
+    # Part 1: parameters to explore
+    if os.path.exists("experiment.png"):
+        print("Experiment figure has been generated, no need to perform hyperparameter search")
+    else:
+        b_candidates = np.linspace(0, 1, 11)
+        k1_candidates = np.linspace(0.5, 2.5, 21) # recommended hyperparameter search range by ChatGPT instead of [0, 10]
+        
+        ndcg_b = []
+        precisions_b = []
+        
+        ndcg_k1 = []
+        precisions_k1 = []
+        
+        # fixed k1, rewarding some about term frequency but not too high to reward (the, a, of), observing b (document length normalizer effect)
+        k1_fixed = 2
+        for b in b_candidates:
+            searcher.set_bm25(k1=k1_fixed, b=b)
+            results = search(searcher, queries, query_id_start=query_id_start)
 
-    results = search(searcher, queries, query_id_start=query_id_start)
+            # Evaluate
+            topk = 10
+            ndcg = compute_ndcg(results, qrels, k=topk)
+            print(f"(k1={k1_fixed}, b={b}) NDCG@{topk}: {ndcg:.4f}")
+            precision = compute_precision(results, qrels, k=topk, threshold=1)
+            print(f"(k1={k1_fixed}, b={b}) Precision@{topk}: {precision:.4f}")
+            
+            ndcg_b.append(ndcg)
+            precisions_b.append(precision)
+            
+        # fixed b, observing the effect of term frequency rewarding from 0.5 to 2
+        b_fixed = 0.8
+        for k1 in k1_candidates:
+            searcher.set_bm25(k1=k1, b=b_fixed)
+            results = search(searcher, queries, query_id_start=query_id_start)
+
+            # Evaluate
+            topk = 10
+            ndcg = compute_ndcg(results, qrels, k=topk)
+            print(f"(k1={k1}, b={b_fixed}) NDCG@{topk}: {ndcg:.4f}")
+            precision = compute_precision(results, qrels, k=topk, threshold=1)
+            print(f"(k1={k1}, b={b_fixed}) Precision@{topk}: {precision:.4f}")
+            
+            ndcg_k1.append(ndcg)
+            precisions_k1.append(precision)
+        
+        # Plotting the results
+        plt.figure(figsize=(10, 5))
+
+        # Plot for b variation
+        plt.subplot(1, 2, 1)
+        plt.plot(b_candidates, precisions_b, label='Precision@10', marker='o')
+        plt.plot(b_candidates, ndcg_b, label='nDCG@10', marker='o')
+        plt.ylim(0.2, 0.4)
+        plt.xlabel('b')
+        plt.ylabel('Score')
+        plt.title(f'Varying b with k1={k1_fixed}')
+        plt.legend()
+
+        # Plot for k1 variation
+        plt.subplot(1, 2, 2)
+        plt.plot(k1_candidates, precisions_k1, label='Precision@10', marker='o')
+        plt.plot(k1_candidates, ndcg_k1, label='nDCG@10', marker='o')
+        plt.ylim(0.2, 0.4)
+        plt.xlabel('k1')
+        plt.ylabel('Score')
+        plt.title(f'Varying k1 with b={b_fixed}')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig('experiment.png')
+        plt.show()
+    
+    
+    # Part 2: Additional Algorithms
+    # according to part 1, the best hyperparameter for BM25 algorithm is b=0.8 and k1=2
+    searcher.set_bm25(k1=2, b=0.8)
+    results_bm25 = search(searcher, queries, query_id_start=query_id_start)
 
     # Debug info
-    print(f"Number of results: {len(results)}")
-    print(f"Sample result: {list(results.items())[0] if results else 'No results'}")
+    print(f"Number of results: {len(results_bm25)}")
+    print(f"Sample result: {list(results_bm25.items())[0] if results else 'No results'}")
 
     # Evaluate
     topk = 10
-    ndcg = compute_ndcg(results, qrels, k=topk)
-    print(f"NDCG@{topk}: {ndcg:.4f}")
+    ndcg = compute_ndcg(results_bm25, qrels, k=topk)
+    precision = compute_precision(results_bm25, qrels, k=topk, threshold=1)
+    print(f"NDCG@{topk}: {ndcg:.4f}, Precision@{topk}: {precision:.4f}")
 
     # Save results
-    with open(f"results_{cname}.json", "w") as f:
-        json.dump({"results": results, "ndcg": ndcg}, f, indent=2)
-
-
+    with open(f"results_{cname}_bm25.json", "w") as f:
+        json.dump({"results": results, "ndcg": ndcg, "precision": precision}, f, indent=2)
+        
 if __name__ == "__main__":
     main()
