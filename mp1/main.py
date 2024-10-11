@@ -1,8 +1,10 @@
 import os
 import json
 from tqdm import tqdm
-from pyserini.search.lucene import LuceneSearcher
+from pyserini.search.lucene import LuceneSearcher, LuceneImpactSearcher
 from pyserini.index.lucene import IndexReader
+from pyserini.search.faiss import FaissSearcher, TctColBertQueryEncoder
+
 import numpy as np
 import subprocess
 import matplotlib.pyplot as plt
@@ -67,7 +69,6 @@ def search(searcher, queries, top_k=10, query_id_start=0):
 
 def compute_ndcg(results, qrels, k=10):
     def dcg(relevances):
-        # return sum((2 ** rel - 1) / np.log2(i + 2) for i, rel in enumerate(relevances[:k]))
         dcg_simple = sum(rel / np.log2(i + 2) for i, rel in enumerate(relevances[:k]))
         return dcg_simple
 
@@ -126,6 +127,8 @@ def compute_precision(results, qrels, k=10, threshold=1):
         return 0.0
     
     return np.mean(precision_scores)
+
+
 
 def main():
     """main function for searching"""
@@ -247,12 +250,9 @@ def main():
     
     # Part 2: Additional Algorithms
     # according to part 1, the best hyperparameter for BM25 algorithm is b=0.8 and k1=2
+    searcher = LuceneSearcher(index_dir)
     searcher.set_bm25(k1=2, b=0.8)
     results_bm25 = search(searcher, queries, query_id_start=query_id_start)
-
-    # Debug info
-    print(f"Number of results: {len(results_bm25)}")
-    print(f"Sample result: {list(results_bm25.items())[0] if results else 'No results'}")
 
     # Evaluate
     topk = 10
@@ -262,7 +262,35 @@ def main():
 
     # Save results
     with open(f"results_{cname}_bm25.json", "w") as f:
-        json.dump({"results": results, "ndcg": ndcg, "precision": precision}, f, indent=2)
-        
+        json.dump({"results": results_bm25, "ndcg": ndcg, "precision": precision}, f, indent=2)
+    
+    
+    # we also experiment relevance feedback and  models for comparison
+    searcher = LuceneSearcher(index_dir)
+    searcher.set_bm25(k1=2, b=0.8)
+    # fetching top-10 terms for re-weighing and top-10 documents for pseudo-relevance
+    searcher.set_rm3(fb_terms=topk, fb_docs=topk, original_query_weight=0.5)
+    result_rm3 = search(searcher, queries, query_id_start=query_id_start)
+    
+    ndcg = compute_ndcg(result_rm3, qrels, k=topk)
+    precision = compute_precision(result_rm3, qrels, k=topk, threshold=1)
+    print(f"NDCG@{topk}: {ndcg:.4f}, Precision@{topk}: {precision:.4f}")
+
+    # Save results
+    with open(f"results_{cname}_rm3.json", "w") as f:
+        json.dump({"results": result_rm3, "ndcg": ndcg, "precision": precision}, f, indent=2)
+    
+    # Using rocchio feedback for compaison
+    searcher = LuceneSearcher(index_dir)
+    searcher.set_rocchio(top_fb_terms=5, top_fb_docs=5, bottom_fb_terms=5, bottom_fb_docs=5, alpha=1, beta=0.75, gamma=0)
+    result_rocchio = search(searcher, queries, query_id_start=query_id_start)
+    ndcg = compute_ndcg(result_rocchio, qrels, k=topk)
+    precision = compute_precision(result_rocchio, qrels, k=topk, threshold=1)
+    print(f"NDCG@{topk}: {ndcg:.4f}, Precision@{topk}: {precision:.4f}")
+
+    # Save results
+    with open(f"results_{cname}_rocchio.json", "w") as f:
+        json.dump({"results": result_rocchio, "ndcg": ndcg, "precision": precision}, f, indent=2)
+    
 if __name__ == "__main__":
     main()
